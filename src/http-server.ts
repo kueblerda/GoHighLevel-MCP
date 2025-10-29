@@ -7,11 +7,11 @@ import express from 'express';
 import cors from 'cors';
 import { Server } from '@modelcontextprotocol/sdk/server/index.js';
 import { SSEServerTransport } from '@modelcontextprotocol/sdk/server/sse.js';
-import { 
+import {
   CallToolRequestSchema,
   ErrorCode,
   ListToolsRequestSchema,
-  McpError 
+  McpError
 } from '@modelcontextprotocol/sdk/types.js';
 import * as dotenv from 'dotenv';
 
@@ -44,6 +44,10 @@ dotenv.config();
 class GHLMCPHttpServer {
   private app: express.Application;
   private server: Server;
+
+  // 🔧 Persistent SSE transport (single instance to preserve sessions)
+  private transport: SSEServerTransport;
+
   private ghlClient: GHLApiClient;
   private contactTools: ContactTools;
   private conversationTools: ConversationTools;
@@ -66,7 +70,7 @@ class GHLMCPHttpServer {
 
   constructor() {
     this.port = parseInt(process.env.PORT || process.env.MCP_SERVER_PORT || '8000');
-    
+
     // Initialize Express app
     this.app = express();
     this.setupExpress();
@@ -84,9 +88,13 @@ class GHLMCPHttpServer {
       }
     );
 
+    // 🔧 Create ONE persistent SSE transport bound to the /sse path
+    //    This object manages session issuance + validation internally.
+    this.transport = new SSEServerTransport('/sse');
+
     // Initialize GHL API client
     this.ghlClient = this.initializeGHLClient();
-    
+
     // Initialize tools
     this.contactTools = new ContactTools(this.ghlClient);
     this.conversationTools = new ConversationTools(this.ghlClient);
@@ -169,7 +177,7 @@ class GHLMCPHttpServer {
     // Handle list tools requests
     this.server.setRequestHandler(ListToolsRequestSchema, async () => {
       console.log('[GHL MCP HTTP] Listing available tools...');
-      
+
       try {
         const contactToolDefinitions = this.contactTools.getToolDefinitions();
         const conversationToolDefinitions = this.conversationTools.getToolDefinitions();
@@ -188,7 +196,7 @@ class GHLMCPHttpServer {
         const surveyToolDefinitions = this.surveyTools.getTools();
         const storeToolDefinitions = this.storeTools.getTools();
         const productsToolDefinitions = this.productsTools.getTools();
-        
+
         const allTools = [
           ...contactToolDefinitions,
           ...conversationToolDefinitions,
@@ -208,9 +216,9 @@ class GHLMCPHttpServer {
           ...storeToolDefinitions,
           ...productsToolDefinitions
         ];
-        
+
         console.log(`[GHL MCP HTTP] Registered ${allTools.length} tools total`);
-        
+
         return {
           tools: allTools
         };
@@ -226,7 +234,7 @@ class GHLMCPHttpServer {
     // Handle tool execution requests
     this.server.setRequestHandler(CallToolRequestSchema, async (request) => {
       const { name, arguments: args } = request.params;
-      
+
       console.log(`[GHL MCP HTTP] Executing tool: ${name}`);
 
       try {
@@ -270,9 +278,9 @@ class GHLMCPHttpServer {
         } else {
           throw new Error(`Unknown tool: ${name}`);
         }
-        
+
         console.log(`[GHL MCP HTTP] Tool ${name} executed successfully`);
-        
+
         return {
           content: [
             {
@@ -283,7 +291,7 @@ class GHLMCPHttpServer {
         };
       } catch (error) {
         console.error(`[GHL MCP HTTP] Error executing tool ${name}:`, error);
-        
+
         throw new McpError(
           ErrorCode.InternalError,
           `Tool execution failed: ${error}`
@@ -298,7 +306,7 @@ class GHLMCPHttpServer {
   private setupRoutes(): void {
     // Health check endpoint
     this.app.get('/health', (req, res) => {
-      res.json({ 
+      res.json({
         status: 'healthy',
         server: 'ghl-mcp-server',
         version: '1.0.0',
@@ -340,7 +348,7 @@ class GHLMCPHttpServer {
         const surveyTools = this.surveyTools.getTools();
         const storeTools = this.storeTools.getTools();
         const productsTools = this.productsTools.getTools();
-        
+
         res.json({
           tools: [...contactTools, ...conversationTools, ...blogTools, ...opportunityTools, ...calendarTools, ...emailTools, ...locationTools, ...emailISVTools, ...socialMediaTools, ...mediaTools, ...objectTools, ...associationTools, ...customFieldV2Tools, ...workflowTools, ...surveyTools, ...storeTools, ...productsTools],
           count: contactTools.length + conversationTools.length + blogTools.length + opportunityTools.length + calendarTools.length + emailTools.length + locationTools.length + emailISVTools.length + socialMediaTools.length + mediaTools.length + objectTools.length + associationTools.length + customFieldV2Tools.length + workflowTools.length + surveyTools.length + storeTools.length + productsTools.length
@@ -350,41 +358,49 @@ class GHLMCPHttpServer {
       }
     });
 
-    // SSE endpoint for ChatGPT MCP connection
-    const handleSSE = async (req: express.Request, res: express.Response) => {
-      const sessionId = req.query.sessionId || 'unknown';
-      console.log(`[GHL MCP HTTP] New SSE connection from: ${req.ip}, sessionId: ${sessionId}, method: ${req.method}`);
-      
+    // ────────────────────────────────────────────────────────────────
+    // SSE endpoints for MCP connection (n8n uses GET stream + POST RPC)
+    // IMPORTANT: Delegate to the SINGLE persistent `this.transport`.
+    // Do NOT create a new transport here, or sessions will be "unknown".
+    // ────────────────────────────────────────────────────────────────
+    this.app.get('/sse', (req, res) => {
+      const sessionId = (req.query.sessionId as string) || 'unknown';
+      console.log(`[GHL MCP HTTP] [GET /sse] ip=${req.ip} sessionId=${sessionId}`);
       try {
-        // Create SSE transport (this will set the headers)
-        const transport = new SSEServerTransport('/sse', res);
-        
-        // Connect MCP server to transport
-        await this.server.connect(transport);
-        
-        console.log(`[GHL MCP HTTP] SSE connection established for session: ${sessionId}`);
-        
-        // Handle client disconnect
-        req.on('close', () => {
-          console.log(`[GHL MCP HTTP] SSE connection closed for session: ${sessionId}`);
-        });
-        
-      } catch (error) {
-        console.error(`[GHL MCP HTTP] SSE connection error for session ${sessionId}:`, error);
-        
-        // Only send error response if headers haven't been sent yet
-        if (!res.headersSent) {
-          res.status(500).json({ error: 'Failed to establish SSE connection' });
+        // Most MCP SDKs expose a handler for GET/SSE stream:
+        // @ts-ignore - some SDK versions type these as public methods
+        if (typeof (this.transport as any).handleRequest === 'function') {
+          (this.transport as any).handleRequest(req, res);
+        } else if (typeof (this.transport as any).handleGet === 'function') {
+          (this.transport as any).handleGet(req, res);
         } else {
-          // If headers were already sent, close the connection
-          res.end();
+          // Fallback: connect per-request would break sessions; warn explicitly
+          console.error('[GHL MCP HTTP] SSE transport missing handleRequest/handleGet. Please update SDK.');
+          res.status(500).json({ error: 'SSE transport not compatible. Update @modelcontextprotocol/sdk.' });
         }
+      } catch (err) {
+        console.error('[GHL MCP HTTP] GET /sse error:', err);
+        if (!res.headersSent) res.status(500).json({ error: 'Failed to establish SSE connection' });
       }
-    };
+    });
 
-    // Handle both GET and POST for SSE (MCP protocol requirements)
-    this.app.get('/sse', handleSSE);
-    this.app.post('/sse', handleSSE);
+    this.app.post('/sse', (req, res) => {
+      const sessionId = (req.query.sessionId as string) || 'unknown';
+      console.log(`[GHL MCP HTTP] [POST /sse] ip=${req.ip} sessionId=${sessionId}`);
+      try {
+        // Most MCP SDKs expose a handler for POST messages paired to session:
+        // @ts-ignore - some SDK versions type these as public methods
+        if (typeof (this.transport as any).handlePost === 'function') {
+          (this.transport as any).handlePost(req, res);
+        } else {
+          console.error('[GHL MCP HTTP] SSE transport missing handlePost. Please update SDK.');
+          res.status(500).json({ error: 'SSE POST not supported by current SDK version' });
+        }
+      } catch (err) {
+        console.error('[GHL MCP HTTP] POST /sse error:', err);
+        if (!res.headersSent) res.status(500).json({ error: 'Failed to process SSE message' });
+      }
+    });
 
     // Root endpoint with server info
     this.app.get('/', (req, res) => {
@@ -426,23 +442,24 @@ class GHLMCPHttpServer {
       surveys: this.surveyTools.getTools().length,
       store: this.storeTools.getTools().length,
       products: this.productsTools.getTools().length,
-      total: this.contactTools.getToolDefinitions().length + 
-             this.conversationTools.getToolDefinitions().length + 
-             this.blogTools.getToolDefinitions().length +
-             this.opportunityTools.getToolDefinitions().length +
-             this.calendarTools.getToolDefinitions().length +
-             this.emailTools.getToolDefinitions().length +
-             this.locationTools.getToolDefinitions().length +
-             this.emailISVTools.getToolDefinitions().length +
-             this.socialMediaTools.getTools().length +
-             this.mediaTools.getToolDefinitions().length +
-             this.objectTools.getToolDefinitions().length +
-             this.associationTools.getTools().length +
-             this.customFieldV2Tools.getTools().length +
-             this.workflowTools.getTools().length +
-             this.surveyTools.getTools().length +
-             this.storeTools.getTools().length +
-             this.productsTools.getTools().length
+      total:
+        this.contactTools.getToolDefinitions().length +
+        this.conversationTools.getToolDefinitions().length +
+        this.blogTools.getToolDefinitions().length +
+        this.opportunityTools.getToolDefinitions().length +
+        this.calendarTools.getToolDefinitions().length +
+        this.emailTools.getToolDefinitions().length +
+        this.locationTools.getToolDefinitions().length +
+        this.emailISVTools.getToolDefinitions().length +
+        this.socialMediaTools.getTools().length +
+        this.mediaTools.getToolDefinitions().length +
+        this.objectTools.getToolDefinitions().length +
+        this.associationTools.getTools().length +
+        this.customFieldV2Tools.getTools().length +
+        this.workflowTools.getTools().length +
+        this.surveyTools.getTools().length +
+        this.storeTools.getTools().length +
+        this.productsTools.getTools().length
     };
   }
 
@@ -504,7 +521,7 @@ class GHLMCPHttpServer {
   private isOpportunityTool(toolName: string): boolean {
     const opportunityToolNames = [
       'search_opportunities', 'get_pipelines', 'get_opportunity', 'create_opportunity',
-      'update_opportunity_status', 'delete_opportunity', 'update_opportunity', 
+      'update_opportunity_status', 'delete_opportunity', 'update_opportunity',
       'upsert_opportunity', 'add_opportunity_followers', 'remove_opportunity_followers'
     ];
     return opportunityToolNames.includes(toolName);
@@ -549,7 +566,7 @@ class GHLMCPHttpServer {
       // Location Tasks
       'search_location_tasks',
       // Custom Fields
-      'get_location_custom_fields', 'create_location_custom_field', 'get_location_custom_field', 
+      'get_location_custom_fields', 'create_location_custom_field', 'get_location_custom_field',
       'update_location_custom_field', 'delete_location_custom_field',
       // Custom Values
       'get_location_custom_values', 'create_location_custom_value', 'get_location_custom_value',
@@ -668,9 +685,9 @@ class GHLMCPHttpServer {
   private async testGHLConnection(): Promise<void> {
     try {
       console.log('[GHL MCP HTTP] Testing GHL API connection...');
-      
+
       const result = await this.ghlClient.testConnection();
-      
+
       console.log('[GHL MCP HTTP] ✅ GHL API connection successful');
       console.log(`[GHL MCP HTTP] Connected to location: ${result.data?.locationId}`);
     } catch (error) {
@@ -685,21 +702,25 @@ class GHLMCPHttpServer {
   async start(): Promise<void> {
     console.log('🚀 Starting GoHighLevel MCP HTTP Server...');
     console.log('=========================================');
-    
+
     try {
       // Test GHL API connection
       await this.testGHLConnection();
-      
+
+      // 🔗 Connect MCP server to the ONE persistent SSE transport.
+      //     This is the key fix: sessions live inside this transport.
+      await this.server.connect(this.transport);
+
       // Start HTTP server
       this.app.listen(this.port, '0.0.0.0', () => {
         console.log('✅ GoHighLevel MCP HTTP Server started successfully!');
         console.log(`🌐 Server running on: http://0.0.0.0:${this.port}`);
         console.log(`🔗 SSE Endpoint: http://0.0.0.0:${this.port}/sse`);
         console.log(`📋 Tools Available: ${this.getToolsCount().total}`);
-        console.log('🎯 Ready for ChatGPT integration!');
+        console.log('🎯 Ready for ChatGPT/n8n integration!');
         console.log('=========================================');
       });
-      
+
     } catch (error) {
       console.error('❌ Failed to start GHL MCP HTTP Server:', error);
       process.exit(1);
@@ -727,11 +748,11 @@ async function main(): Promise<void> {
   try {
     // Setup graceful shutdown
     setupGracefulShutdown();
-    
+
     // Create and start HTTP server
     const server = new GHLMCPHttpServer();
     await server.start();
-    
+
   } catch (error) {
     console.error('💥 Fatal error:', error);
     process.exit(1);
@@ -742,4 +763,4 @@ async function main(): Promise<void> {
 main().catch((error) => {
   console.error('Unhandled error:', error);
   process.exit(1);
-}); 
+});
